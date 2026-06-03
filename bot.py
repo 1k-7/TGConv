@@ -42,7 +42,6 @@ class ArchiveStandaloneWorkflow(StatesGroup):
 
 
 # --- Archive Utilities ---
-
 def create_zip(file_paths: Union[str, List[str]], output_path: str) -> str:
     """Compresses a file, directory, or list of files into a ZIP archive."""
     if not output_path.endswith('.zip'):
@@ -82,7 +81,6 @@ def extract_archive(archive_path: str, extract_to: str) -> str:
 
 
 # --- Keyboards ---
-
 def get_input_file_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -116,12 +114,13 @@ def get_output_format_kb(exclude_format: str) -> InlineKeyboardMarkup:
         if fmt_id != exclude_format:
             buttons.append(InlineKeyboardButton(text=display_name, callback_data=f"out_{fmt_id}"))
             
-    # Arrange buttons 2 per row for better UI
     rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-# --- CONVERSION HANDLERS ---
+# ==========================================
+# COMMAND HANDLERS (Top Priority)
+# ==========================================
 
 @dp.message(CommandStart())
 async def start_handler(message: Message, state: FSMContext):
@@ -134,11 +133,139 @@ async def start_handler(message: Message, state: FSMContext):
     )
     await state.set_state(ConversionWorkflow.waiting_for_input)
 
-@dp.message(ConversionWorkflow.waiting_for_input, F.text)
+@dp.message(Command("unzip"))
+async def cmd_unzip(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Send me any `.zip` or `.rar` file, and I will extract the contents for you.")
+    await state.set_state(ArchiveStandaloneWorkflow.waiting_for_unzip)
+
+@dp.message(Command("zip"))
+async def cmd_zip(message: Message, state: FSMContext):
+    await state.clear()
+    
+    # Check if the user is replying to a document for instant zipping
+    if message.reply_to_message and message.reply_to_message.document:
+        user_id = message.from_user.id
+        working_dir = os.path.abspath(f"./temp/zip_single_{user_id}_{message.message_id}")
+        os.makedirs(working_dir, exist_ok=True)
+        
+        doc = message.reply_to_message.document
+        file_path = os.path.join(working_dir, doc.file_name)
+        
+        status_msg = await message.answer("📥 Downloading replied file...")
+        await bot.download(doc, destination=file_path)
+        
+        await status_msg.edit_text("🗜 Zipping file...")
+        try:
+            # Generate the output zip named after the original file
+            base_name = os.path.splitext(doc.file_name)[0]
+            output_archive = os.path.join(working_dir, f"{base_name}.zip")
+            create_zip(file_path, output_archive)
+            
+            await message.answer_document(FSInputFile(output_archive))
+            await status_msg.edit_text("✅ Zipping complete!")
+        except Exception as e:
+            await status_msg.edit_text(f"❌ Error zipping: `{str(e)}`", parse_mode="Markdown")
+        finally:
+            shutil.rmtree(working_dir, ignore_errors=True)
+            await state.set_state(ConversionWorkflow.waiting_for_input)
+        return
+
+    # If not replying to a file, proceed with multi-file zip logic
+    await state.update_data(files_to_zip=[])
+    await message.answer(
+        "Send me the files you want to zip one by one.\n"
+        "When you are finished, send the command /done to get your archive."
+    )
+    await state.set_state(ArchiveStandaloneWorkflow.waiting_for_zip_files)
+
+
+# ==========================================
+# STANDALONE ARCHIVE FILE HANDLERS
+# ==========================================
+
+@dp.message(ArchiveStandaloneWorkflow.waiting_for_unzip, F.document)
+async def process_standalone_unzip(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    working_dir = os.path.abspath(f"./temp/unzip_{user_id}_{message.message_id}")
+    os.makedirs(working_dir, exist_ok=True)
+    
+    file_path = os.path.join(working_dir, message.document.file_name)
+    await bot.download(message.document, destination=file_path)
+    
+    status_msg = await message.answer("📦 Extracting...")
+    
+    try:
+        extract_dir = os.path.join(working_dir, "extracted")
+        extract_archive(file_path, extract_dir)
+        
+        for root, _, files in os.walk(extract_dir):
+            for file in files:
+                extracted_file_path = os.path.join(root, file)
+                await message.answer_document(FSInputFile(extracted_file_path))
+                
+        await status_msg.edit_text("✅ Extraction complete!")
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Error extracting: `{str(e)}`", parse_mode="Markdown")
+    finally:
+        shutil.rmtree(working_dir, ignore_errors=True)
+        await state.clear()
+        await state.set_state(ConversionWorkflow.waiting_for_input)
+
+@dp.message(ArchiveStandaloneWorkflow.waiting_for_zip_files, F.document)
+async def collect_files_for_zip(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    working_dir = os.path.abspath(f"./temp/zip_{user_id}")
+    os.makedirs(working_dir, exist_ok=True)
+    
+    file_path = os.path.join(working_dir, message.document.file_name)
+    await bot.download(message.document, destination=file_path)
+    
+    data = await state.get_data()
+    files_list = data.get("files_to_zip", [])
+    files_list.append(file_path)
+    
+    await state.update_data(files_to_zip=files_list)
+    await message.answer(f"Added `{message.document.file_name}`. Send more or type /done.", parse_mode="Markdown")
+
+@dp.message(ArchiveStandaloneWorkflow.waiting_for_zip_files, Command("done"))
+async def process_standalone_zip(message: Message, state: FSMContext):
+    data = await state.get_data()
+    files_list = data.get("files_to_zip", [])
+    user_id = message.from_user.id
+    working_dir = os.path.abspath(f"./temp/zip_{user_id}")
+    
+    if not files_list:
+        await message.answer("You didn't send any files! Zipping cancelled.")
+        await state.clear()
+        await state.set_state(ConversionWorkflow.waiting_for_input)
+        return
+        
+    status_msg = await message.answer("🗜 Zipping files...")
+    
+    try:
+        output_archive = os.path.join(working_dir, "Archive.zip")
+        create_zip(files_list, output_archive)
+        
+        await message.answer_document(FSInputFile(output_archive))
+        await status_msg.edit_text("✅ Zipping complete!")
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Error zipping: `{str(e)}`", parse_mode="Markdown")
+    finally:
+        shutil.rmtree(working_dir, ignore_errors=True)
+        await state.clear()
+        await state.set_state(ConversionWorkflow.waiting_for_input)
+
+
+# ==========================================
+# CONVERSION HANDLERS
+# ==========================================
+
+# FIX: Added `~F.text.startswith('/')` to explicitly ignore commands
+@dp.message(ConversionWorkflow.waiting_for_input, F.text & ~F.text.startswith('/'))
 async def handle_text(message: Message, state: FSMContext):
     session_string = message.text.strip()
     
-    # Filter out normal chat
     if len(session_string) < 50:
         await message.answer("That string looks too short to be a valid session string. Please send a valid string, file, or archive.")
         return
@@ -153,7 +280,7 @@ async def handle_text(message: Message, state: FSMContext):
 
 @dp.message(ConversionWorkflow.waiting_for_input, F.document)
 async def handle_document(message: Message, state: FSMContext):
-    user_dir = os.path.abspath(f"./temp/{message.from_user.id}")
+    user_dir = os.path.abspath(f"./temp/{message.from_user.id}_{message.message_id}")
     os.makedirs(user_dir, exist_ok=True)
     
     file_path = os.path.join(user_dir, message.document.file_name)
@@ -209,113 +336,32 @@ async def execute_conversion(callback: CallbackQuery, state: FSMContext):
         await callback.message.edit_text(f"❌ **Error during conversion:**\n`{str(e)}`", parse_mode="Markdown")
         
     finally:
-        user_dir = os.path.abspath(f"./temp/{user_id}")
-        shutil.rmtree(user_dir, ignore_errors=True)
+        # Cleanup parent temp path specifically
+        file_path = data.get("file_path")
+        if file_path:
+            shutil.rmtree(os.path.dirname(file_path), ignore_errors=True)
+        else:
+            shutil.rmtree(os.path.abspath(f"./temp/{user_id}"), ignore_errors=True)
+            
         await state.clear()
         await state.set_state(ConversionWorkflow.waiting_for_input)
 
 
-# --- STANDALONE ARCHIVE HANDLERS ---
-
-@dp.message(Command("unzip"))
-async def cmd_unzip(message: Message, state: FSMContext):
-    await state.clear()
-    await message.answer("Send me any `.zip` or `.rar` file, and I will extract the contents for you.")
-    await state.set_state(ArchiveStandaloneWorkflow.waiting_for_unzip)
-
-@dp.message(ArchiveStandaloneWorkflow.waiting_for_unzip, F.document)
-async def process_standalone_unzip(message: Message, state: FSMContext):
-    user_id = message.from_user.id
-    working_dir = os.path.abspath(f"./temp/unzip_{user_id}")
-    os.makedirs(working_dir, exist_ok=True)
-    
-    file_path = os.path.join(working_dir, message.document.file_name)
-    await bot.download(message.document, destination=file_path)
-    
-    status_msg = await message.answer("📦 Extracting...")
-    
-    try:
-        extract_dir = os.path.join(working_dir, "extracted")
-        extract_archive(file_path, extract_dir)
-        
-        # Send all extracted files back to the user
-        for root, _, files in os.walk(extract_dir):
-            for file in files:
-                extracted_file_path = os.path.join(root, file)
-                await message.answer_document(FSInputFile(extracted_file_path))
-                
-        await status_msg.edit_text("✅ Extraction complete!")
-    except Exception as e:
-        await status_msg.edit_text(f"❌ Error extracting: `{str(e)}`", parse_mode="Markdown")
-    finally:
-        shutil.rmtree(working_dir, ignore_errors=True)
-        await state.clear()
-        await state.set_state(ConversionWorkflow.waiting_for_input)
-
-@dp.message(Command("zip"))
-async def cmd_zip(message: Message, state: FSMContext):
-    await state.clear()
-    await state.update_data(files_to_zip=[])
-    await message.answer(
-        "Send me the files you want to zip one by one.\n"
-        "When you are finished, send the command /done to get your archive."
-    )
-    await state.set_state(ArchiveStandaloneWorkflow.waiting_for_zip_files)
-
-@dp.message(ArchiveStandaloneWorkflow.waiting_for_zip_files, F.document)
-async def collect_files_for_zip(message: Message, state: FSMContext):
-    user_id = message.from_user.id
-    working_dir = os.path.abspath(f"./temp/zip_{user_id}")
-    os.makedirs(working_dir, exist_ok=True)
-    
-    file_path = os.path.join(working_dir, message.document.file_name)
-    await bot.download(message.document, destination=file_path)
-    
-    data = await state.get_data()
-    files_list = data.get("files_to_zip", [])
-    files_list.append(file_path)
-    
-    await state.update_data(files_to_zip=files_list)
-    await message.answer(f"Added `{message.document.file_name}`. Send more or type /done.", parse_mode="Markdown")
-
-@dp.message(ArchiveStandaloneWorkflow.waiting_for_zip_files, Command("done"))
-async def process_standalone_zip(message: Message, state: FSMContext):
-    data = await state.get_data()
-    files_list = data.get("files_to_zip", [])
-    user_id = message.from_user.id
-    working_dir = os.path.abspath(f"./temp/zip_{user_id}")
-    
-    if not files_list:
-        await message.answer("You didn't send any files! Zipping cancelled.")
-        await state.clear()
-        await state.set_state(ConversionWorkflow.waiting_for_input)
-        return
-        
-    status_msg = await message.answer("🗜 Zipping files...")
-    
-    try:
-        output_archive = os.path.join(working_dir, "Archive.zip")
-        create_zip(files_list, output_archive)
-        
-        await message.answer_document(FSInputFile(output_archive))
-        await status_msg.edit_text("✅ Zipping complete!")
-    except Exception as e:
-        await status_msg.edit_text(f"❌ Error zipping: `{str(e)}`", parse_mode="Markdown")
-    finally:
-        shutil.rmtree(working_dir, ignore_errors=True)
-        await state.clear()
-        await state.set_state(ConversionWorkflow.waiting_for_input)
-
-
-# --- CONVERSION LOGIC CORE ---
+# ==========================================
+# CONVERSION LOGIC CORE
+# ==========================================
 
 async def process_session(data: dict, output_format: str, user_id: int) -> Dict[str, str]:
-    working_dir = os.path.abspath(f"./temp/{user_id}")
-    os.makedirs(working_dir, exist_ok=True)
-    
     input_format = data.get("input_format")
     is_string = data.get("is_string")
     
+    # Use specific parent directory of file to ensure clean up if passing file
+    if not is_string and data.get("file_path"):
+        working_dir = os.path.dirname(os.path.abspath(data.get("file_path")))
+    else:
+        working_dir = os.path.abspath(f"./temp/conv_str_{user_id}")
+        os.makedirs(working_dir, exist_ok=True)
+        
     session = None
     
     # 1. LOAD SESSION INTO MANAGER
