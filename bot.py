@@ -189,8 +189,8 @@ async def execute_conversion(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text("⏳ Processing conversion...")
     
     try:
-        # Run synchronous TGConvertor processes without blocking the main loop
-        result = await asyncio.to_thread(process_session, data, output_fmt, user_id)
+        # Await the coroutine natively
+        result = await process_session(data, output_fmt, user_id)
         
         if result["type"] == "file":
             await callback.message.answer_document(FSInputFile(result["data"]))
@@ -215,7 +215,7 @@ async def execute_conversion(callback: CallbackQuery, state: FSMContext):
 
 # --- Conversion Logic Core ---
 
-def process_session(data: dict, output_format: str, user_id: int) -> Dict[str, str]:
+async def process_session(data: dict, output_format: str, user_id: int) -> Dict[str, str]:
     """Handles the extraction, TGConvertor ingestion, and output generation workflow."""
     
     # Enforce absolute paths to prevent SQLite directory confusion
@@ -231,6 +231,7 @@ def process_session(data: dict, output_format: str, user_id: int) -> Dict[str, s
     if is_string:
         session_string = data.get("session_string")
         if input_format == "telestr":
+            # Strings operate synchronously
             session = SessionManager.from_telethon_string(session_string)
         elif input_format == "pyrostr":
             session = SessionManager.from_pyrogram_string(session_string)
@@ -244,12 +245,13 @@ def process_session(data: dict, output_format: str, user_id: int) -> Dict[str, s
             extract_archive(file_path, extract_dir)
             input_target = extract_dir
             
+        # Files and TData operate asynchronously
         if input_format == "telethon":
-            session = SessionManager.from_telethon_file(input_target)
+            session = await SessionManager.from_telethon_file(input_target)
         elif input_format == "pyrogram":
-            session = SessionManager.from_pyrogram_file(input_target)
+            session = await SessionManager.from_pyrogram_file(input_target)
         elif input_format == "tdata":
-            session = SessionManager.from_tdata_folder(input_target)
+            session = await SessionManager.from_tdata_folder(input_target)
 
     # 2. EXPORT SESSION
     if output_format == "telestr":
@@ -265,13 +267,13 @@ def process_session(data: dict, output_format: str, user_id: int) -> Dict[str, s
         
         if output_format == "telethon":
             output_target += ".session"
-            session.to_telethon_file(output_target)
+            await session.to_telethon_file(output_target)
         elif output_format == "pyrogram":
             output_target += ".session"
-            session.to_pyrogram_file(output_target)
+            await session.to_pyrogram_file(output_target)
         elif output_format == "tdata":
             output_folder = os.path.join(working_dir, "tdata_out")
-            session.to_tdata_folder(output_folder)
+            await session.to_tdata_folder(output_folder)
             output_target = create_zip(output_folder, output_folder + ".zip")
             
         # Safety check to dynamically find the file if TGConvertor mangled the extension
