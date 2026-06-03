@@ -148,7 +148,8 @@ async def handle_text(message: Message, state: FSMContext):
 
 @dp.message(F.document)
 async def handle_document(message: Message, state: FSMContext):
-    user_dir = f"./temp/{message.from_user.id}"
+    # Enforce absolute pathing right from the download step
+    user_dir = os.path.abspath(f"./temp/{message.from_user.id}")
     os.makedirs(user_dir, exist_ok=True)
     
     file_path = os.path.join(user_dir, message.document.file_name)
@@ -205,8 +206,9 @@ async def execute_conversion(callback: CallbackQuery, state: FSMContext):
         await callback.message.edit_text(f"❌ **Error during conversion:**\n`{str(e)}`", parse_mode="Markdown")
         
     finally:
-        # Cleanup temp files
-        shutil.rmtree(f"./temp/{user_id}", ignore_errors=True)
+        # Cleanup temp files safely using absolute paths
+        user_dir = os.path.abspath(f"./temp/{user_id}")
+        shutil.rmtree(user_dir, ignore_errors=True)
         await state.clear()
         await state.set_state(ConversionWorkflow.waiting_for_input)
 
@@ -215,10 +217,13 @@ async def execute_conversion(callback: CallbackQuery, state: FSMContext):
 
 def process_session(data: dict, output_format: str, user_id: int) -> Dict[str, str]:
     """Handles the extraction, TGConvertor ingestion, and output generation workflow."""
+    
+    # Enforce absolute paths to prevent SQLite directory confusion
+    working_dir = os.path.abspath(f"./temp/{user_id}")
+    os.makedirs(working_dir, exist_ok=True)
+    
     input_format = data.get("input_format")
     is_string = data.get("is_string")
-    working_dir = f"./temp/{user_id}"
-    os.makedirs(working_dir, exist_ok=True)
     
     session = None
     
@@ -230,7 +235,8 @@ def process_session(data: dict, output_format: str, user_id: int) -> Dict[str, s
         elif input_format == "pyrostr":
             session = SessionManager.from_pyrogram_string(session_string)
     else:
-        file_path = data.get("file_path")
+        # Ensure input file path is absolute
+        file_path = os.path.abspath(data.get("file_path"))
         input_target = file_path
         
         if input_format == "tdata":
@@ -256,6 +262,7 @@ def process_session(data: dict, output_format: str, user_id: int) -> Dict[str, s
         
     else:
         output_target = os.path.join(working_dir, "converted_session")
+        
         if output_format == "telethon":
             output_target += ".session"
             session.to_telethon_file(output_target)
@@ -266,6 +273,18 @@ def process_session(data: dict, output_format: str, user_id: int) -> Dict[str, s
             output_folder = os.path.join(working_dir, "tdata_out")
             session.to_tdata_folder(output_folder)
             output_target = create_zip(output_folder, output_folder + ".zip")
+            
+        # Safety check to dynamically find the file if TGConvertor mangled the extension
+        if not os.path.exists(output_target):
+            expected_ext = ".zip" if output_format == "tdata" else ".session"
+            for file in os.listdir(working_dir):
+                if file.endswith(expected_ext) and "converted_session" in file:
+                    output_target = os.path.join(working_dir, file)
+                    break
+                    
+        # Final validation to guarantee we don't pass a dead path to aiogram
+        if not os.path.exists(output_target):
+            raise FileNotFoundError(f"TGConvertor failed to generate the output file in {working_dir}")
             
         return {"type": "file", "data": output_target}
 
