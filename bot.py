@@ -41,9 +41,8 @@ class ArchiveStandaloneWorkflow(StatesGroup):
     waiting_for_zip_files = State()
 
 
-# --- Archive Utilities ---
+# --- Archive & Path Utilities ---
 def create_zip(file_paths: Union[str, List[str]], output_path: str) -> str:
-    """Compresses a file, directory, or list of files into a ZIP archive."""
     if not output_path.endswith('.zip'):
         output_path += '.zip'
         
@@ -63,13 +62,10 @@ def create_zip(file_paths: Union[str, List[str]], output_path: str) -> str:
     return output_path
 
 def extract_archive(archive_path: str, extract_to: str) -> str:
-    """Extracts a .zip or .rar archive."""
     os.makedirs(extract_to, exist_ok=True)
-    
     if archive_path.lower().endswith('.zip'):
         with zipfile.ZipFile(archive_path, 'r') as zip_ref:
             zip_ref.extractall(extract_to)
-            
     elif archive_path.lower().endswith('.rar'):
         if not RAR_SUPPORTED:
             raise RuntimeError("rarfile package or unrar system dependency missing.")
@@ -78,6 +74,20 @@ def extract_archive(archive_path: str, extract_to: str) -> str:
     else:
         raise ValueError("Unsupported archive format. Send .zip or .rar.")
     return extract_to
+
+def find_tdata_root(base_path: str) -> str:
+    # 1. Destroy Mac OS junk immediately
+    for root, dirs, _ in os.walk(base_path, topdown=False):
+        for name in dirs:
+            if name == "__MACOSX":
+                shutil.rmtree(os.path.join(root, name), ignore_errors=True)
+                
+    # 2. Look for the directory containing 'key_data' (standard TData signature)
+    for root, _, files in os.walk(base_path):
+        if any(f.startswith("key_data") for f in files):
+            return root
+            
+    return base_path
 
 
 # --- Keyboards ---
@@ -119,7 +129,7 @@ def get_output_format_kb(exclude_format: str) -> InlineKeyboardMarkup:
 
 
 # ==========================================
-# COMMAND HANDLERS (Top Priority)
+# COMMAND HANDLERS
 # ==========================================
 
 @dp.message(CommandStart())
@@ -142,8 +152,6 @@ async def cmd_unzip(message: Message, state: FSMContext):
 @dp.message(Command("zip"))
 async def cmd_zip(message: Message, state: FSMContext):
     await state.clear()
-    
-    # Check if the user is replying to a document for instant zipping
     if message.reply_to_message and message.reply_to_message.document:
         user_id = message.from_user.id
         working_dir = os.path.abspath(f"./temp/zip_single_{user_id}_{message.message_id}")
@@ -157,7 +165,6 @@ async def cmd_zip(message: Message, state: FSMContext):
         
         await status_msg.edit_text("🗜 Zipping file...")
         try:
-            # Generate the output zip named after the original file
             base_name = os.path.splitext(doc.file_name)[0]
             output_archive = os.path.join(working_dir, f"{base_name}.zip")
             create_zip(file_path, output_archive)
@@ -171,7 +178,6 @@ async def cmd_zip(message: Message, state: FSMContext):
             await state.set_state(ConversionWorkflow.waiting_for_input)
         return
 
-    # If not replying to a file, proceed with multi-file zip logic
     await state.update_data(files_to_zip=[])
     await message.answer(
         "Send me the files you want to zip one by one.\n"
@@ -198,6 +204,7 @@ async def process_standalone_unzip(message: Message, state: FSMContext):
     try:
         extract_dir = os.path.join(working_dir, "extracted")
         extract_archive(file_path, extract_dir)
+        find_tdata_root(extract_dir)
         
         for root, _, files in os.walk(extract_dir):
             for file in files:
@@ -261,7 +268,6 @@ async def process_standalone_zip(message: Message, state: FSMContext):
 # CONVERSION HANDLERS
 # ==========================================
 
-# FIX: Added `~F.text.startswith('/')` to explicitly ignore commands
 @dp.message(ConversionWorkflow.waiting_for_input, F.text & ~F.text.startswith('/'))
 async def handle_text(message: Message, state: FSMContext):
     session_string = message.text.strip()
@@ -326,51 +332,61 @@ async def execute_conversion(callback: CallbackQuery, state: FSMContext):
             await callback.message.answer_document(FSInputFile(result["data"]))
             await callback.message.edit_text("✅ **Conversion successful!**", parse_mode="Markdown")
         elif result["type"] == "string":
+            # If multiple strings were generated, they'll be separated by '---'
             await callback.message.edit_text(
-                f"✅ **Conversion successful! Here is your string:**\n\n`{result['data']}`", 
+                f"✅ **Conversion successful! Here is your string(s):**\n\n`{result['data']}`", 
                 parse_mode="Markdown"
             )
             
     except Exception as e:
         logging.error(f"Conversion error: {e}")
-        await callback.message.edit_text(f"❌ **Error during conversion:**\n`{str(e)}`", parse_mode="Markdown")
+        error_msg = str(e).lower()
+        
+        if any(word in error_msg for word in ["decrypt", "password", "pad block", "auth"]):
+            reply_text = "❌ **Decryption Failed:** The session might be corrupted, or it is locked with a local passcode."
+        elif "sqlite" in error_msg or "database" in error_msg:
+            reply_text = "❌ **Database Error:** The session file appears to be corrupted or in an unsupported format."
+        elif "unsupported" in error_msg or "format" in error_msg:
+            reply_text = "❌ **Format Error:** The archive or session format is unsupported."
+        else:
+            reply_text = f"❌ **Error during conversion:**\n`{str(e)}`"
+            
+        await callback.message.edit_text(reply_text, parse_mode="Markdown")
         
     finally:
-        # Cleanup parent temp path specifically
         file_path = data.get("file_path")
         if file_path:
             shutil.rmtree(os.path.dirname(file_path), ignore_errors=True)
         else:
-            shutil.rmtree(os.path.abspath(f"./temp/{user_id}"), ignore_errors=True)
+            shutil.rmtree(os.path.abspath(f"./temp/conv_str_{user_id}"), ignore_errors=True)
             
         await state.clear()
         await state.set_state(ConversionWorkflow.waiting_for_input)
 
 
 # ==========================================
-# CONVERSION LOGIC CORE
+# CONVERSION LOGIC CORE (MULTI-ACCOUNT)
 # ==========================================
 
 async def process_session(data: dict, output_format: str, user_id: int) -> Dict[str, str]:
     input_format = data.get("input_format")
     is_string = data.get("is_string")
     
-    # Use specific parent directory of file to ensure clean up if passing file
     if not is_string and data.get("file_path"):
         working_dir = os.path.dirname(os.path.abspath(data.get("file_path")))
     else:
         working_dir = os.path.abspath(f"./temp/conv_str_{user_id}")
         os.makedirs(working_dir, exist_ok=True)
         
-    session = None
+    sessions = []
     
-    # 1. LOAD SESSION INTO MANAGER
+    # 1. LOAD SESSIONS INTO MANAGER(S)
     if is_string:
         session_string = data.get("session_string")
         if input_format == "telestr":
-            session = SessionManager.from_telethon_string(session_string)
+            sessions.append(SessionManager.from_telethon_string(session_string))
         elif input_format == "pyrostr":
-            session = SessionManager.from_pyrogram_string(session_string)
+            sessions.append(SessionManager.from_pyrogram_string(session_string))
     else:
         file_path = os.path.abspath(data.get("file_path"))
         input_target = file_path
@@ -378,49 +394,92 @@ async def process_session(data: dict, output_format: str, user_id: int) -> Dict[
         if input_format == "tdata":
             extract_dir = os.path.join(working_dir, "tdata_extracted")
             extract_archive(file_path, extract_dir)
-            input_target = extract_dir
+            input_target = find_tdata_root(extract_dir)
             
-        if input_format == "telethon":
-            session = await SessionManager.from_telethon_file(input_target)
+            # Direct `opentele` integration to scrape all embedded accounts
+            from opentele.td import TDesktop
+            try:
+                td = TDesktop(input_target)
+                for account in td.accounts:
+                    sessions.append(SessionManager(
+                        auth_key=account.authKey.key,
+                        user_id=account.UserId,
+                        dc_id=account.MainDcId
+                    ))
+            except Exception as e:
+                raise ValueError(f"Failed to load TData (maybe password protected or corrupted): {str(e)}")
+                
+            if not sessions:
+                raise ValueError("No valid sessions found in TData folder.")
+                
+        elif input_format == "telethon":
+            sessions.append(await SessionManager.from_telethon_file(input_target))
         elif input_format == "pyrogram":
-            session = await SessionManager.from_pyrogram_file(input_target)
-        elif input_format == "tdata":
-            session = await SessionManager.from_tdata_folder(input_target)
+            sessions.append(await SessionManager.from_pyrogram_file(input_target))
 
-    # 2. EXPORT SESSION
-    if output_format == "telestr":
-        string_out = session.to_telethon_string()
-        return {"type": "string", "data": string_out}
-        
-    elif output_format == "pyrostr":
-        string_out = session.to_pyrogram_string()
-        return {"type": "string", "data": string_out}
-        
-    else:
-        output_target = os.path.join(working_dir, "converted_session")
-        
-        if output_format == "telethon":
-            output_target += ".session"
-            await session.to_telethon_file(output_target)
-        elif output_format == "pyrogram":
-            output_target += ".session"
-            await session.to_pyrogram_file(output_target)
-        elif output_format == "tdata":
-            output_folder = os.path.join(working_dir, "tdata_out")
-            await session.to_tdata_folder(output_folder)
-            output_target = create_zip(output_folder, output_folder + ".zip")
+
+    # 2. EXPORT SESSIONS
+    if output_format in ["telestr", "pyrostr"]:
+        strings_out = []
+        for s in sessions:
+            if output_format == "telestr":
+                strings_out.append(s.to_telethon_string())
+            elif output_format == "pyrostr":
+                strings_out.append(s.to_pyrogram_string())
+                
+        if len(strings_out) == 1:
+            return {"type": "string", "data": strings_out[0]}
+        else:
+            return {"type": "string", "data": "\n\n---\n\n".join(strings_out)}
             
+    else:
+        # File Outputs
+        if len(sessions) == 1:
+            s = sessions[0]
+            output_target = os.path.join(working_dir, "converted_session")
+            
+            if output_format == "telethon":
+                output_target += ".session"
+                await s.to_telethon_file(output_target)
+            elif output_format == "pyrogram":
+                output_target += ".session"
+                await s.to_pyrogram_file(output_target)
+            elif output_format == "tdata":
+                output_folder = os.path.join(working_dir, "tdata_out")
+                await s.to_tdata_folder(output_folder)
+                output_target = create_zip(output_folder, output_folder + ".zip")
+                
+            if not os.path.exists(output_target):
+                expected_ext = ".zip" if output_format == "tdata" else ".session"
+                for file in os.listdir(working_dir):
+                    if file.endswith(expected_ext) and "converted_session" in file:
+                        output_target = os.path.join(working_dir, file)
+                        break
+        else:
+            # Multi-account batch processing logic
+            output_folder = os.path.join(working_dir, "converted_sessions")
+            os.makedirs(output_folder, exist_ok=True)
+            
+            for i, s in enumerate(sessions):
+                sid = getattr(s, 'user_id', f"account_{i+1}")
+                if output_format == "tdata":
+                    folder_path = os.path.join(output_folder, f"tdata_{sid}")
+                    await s.to_tdata_folder(folder_path)
+                else:
+                    file_path = os.path.join(output_folder, f"{sid}.session")
+                    if output_format == "telethon":
+                        await s.to_telethon_file(file_path)
+                    elif output_format == "pyrogram":
+                        await s.to_pyrogram_file(file_path)
+                        
+            # Repackage the multiple outputs into a single zip structure
+            output_target = create_zip(output_folder, output_folder + ".zip")
+
         if not os.path.exists(output_target):
-            expected_ext = ".zip" if output_format == "tdata" else ".session"
-            for file in os.listdir(working_dir):
-                if file.endswith(expected_ext) and "converted_session" in file:
-                    output_target = os.path.join(working_dir, file)
-                    break
-                    
-        if not os.path.exists(output_target):
-            raise FileNotFoundError(f"TGConvertor failed to generate the output file in {working_dir}")
+            raise FileNotFoundError(f"TGConvertor failed to generate the output file(s).")
             
         return {"type": "file", "data": output_target}
+
 
 if __name__ == "__main__":
     asyncio.run(dp.start_polling(bot))
