@@ -1,5 +1,6 @@
 aiogram>=3.4.1
-TGConvertor[tdata]
+TGConvertor
+opentele
 telethon
 Kurigram
 tgcrypto
