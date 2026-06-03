@@ -5,7 +5,7 @@ import asyncio
 import logging
 from typing import List, Union, Dict
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, 
     InlineKeyboardButton, FSInputFile
@@ -35,6 +35,10 @@ class ConversionWorkflow(StatesGroup):
     file_path = State()
     session_string = State()
     is_string = State()
+
+class ArchiveStandaloneWorkflow(StatesGroup):
+    waiting_for_unzip = State()
+    waiting_for_zip_files = State()
 
 
 # --- Archive Utilities ---
@@ -117,23 +121,24 @@ def get_output_format_kb(exclude_format: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-# --- Handlers ---
+# --- CONVERSION HANDLERS ---
 
 @dp.message(CommandStart())
 async def start_handler(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
         "**TGConvertor Bot** ⚡️\n\n"
-        "Send me a `.session` file, a `.zip`/`.rar` containing a TData folder, or a **Session String** to begin.",
+        "Send me a `.session` file, a `.zip`/`.rar` containing a TData folder, or a **Session String** to begin conversion.\n\n"
+        "You can also use /zip or /unzip for general archive management.",
         parse_mode="Markdown"
     )
     await state.set_state(ConversionWorkflow.waiting_for_input)
 
-@dp.message(F.text)
+@dp.message(ConversionWorkflow.waiting_for_input, F.text)
 async def handle_text(message: Message, state: FSMContext):
     session_string = message.text.strip()
     
-    # Filter out normal chat (session strings are typically long)
+    # Filter out normal chat
     if len(session_string) < 50:
         await message.answer("That string looks too short to be a valid session string. Please send a valid string, file, or archive.")
         return
@@ -146,9 +151,8 @@ async def handle_text(message: Message, state: FSMContext):
         parse_mode="Markdown"
     )
 
-@dp.message(F.document)
+@dp.message(ConversionWorkflow.waiting_for_input, F.document)
 async def handle_document(message: Message, state: FSMContext):
-    # Enforce absolute pathing right from the download step
     user_dir = os.path.abspath(f"./temp/{message.from_user.id}")
     os.makedirs(user_dir, exist_ok=True)
     
@@ -189,7 +193,6 @@ async def execute_conversion(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text("⏳ Processing conversion...")
     
     try:
-        # Await the coroutine natively
         result = await process_session(data, output_fmt, user_id)
         
         if result["type"] == "file":
@@ -206,19 +209,107 @@ async def execute_conversion(callback: CallbackQuery, state: FSMContext):
         await callback.message.edit_text(f"❌ **Error during conversion:**\n`{str(e)}`", parse_mode="Markdown")
         
     finally:
-        # Cleanup temp files safely using absolute paths
         user_dir = os.path.abspath(f"./temp/{user_id}")
         shutil.rmtree(user_dir, ignore_errors=True)
         await state.clear()
         await state.set_state(ConversionWorkflow.waiting_for_input)
 
 
-# --- Conversion Logic Core ---
+# --- STANDALONE ARCHIVE HANDLERS ---
+
+@dp.message(Command("unzip"))
+async def cmd_unzip(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Send me any `.zip` or `.rar` file, and I will extract the contents for you.")
+    await state.set_state(ArchiveStandaloneWorkflow.waiting_for_unzip)
+
+@dp.message(ArchiveStandaloneWorkflow.waiting_for_unzip, F.document)
+async def process_standalone_unzip(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    working_dir = os.path.abspath(f"./temp/unzip_{user_id}")
+    os.makedirs(working_dir, exist_ok=True)
+    
+    file_path = os.path.join(working_dir, message.document.file_name)
+    await bot.download(message.document, destination=file_path)
+    
+    status_msg = await message.answer("📦 Extracting...")
+    
+    try:
+        extract_dir = os.path.join(working_dir, "extracted")
+        extract_archive(file_path, extract_dir)
+        
+        # Send all extracted files back to the user
+        for root, _, files in os.walk(extract_dir):
+            for file in files:
+                extracted_file_path = os.path.join(root, file)
+                await message.answer_document(FSInputFile(extracted_file_path))
+                
+        await status_msg.edit_text("✅ Extraction complete!")
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Error extracting: `{str(e)}`", parse_mode="Markdown")
+    finally:
+        shutil.rmtree(working_dir, ignore_errors=True)
+        await state.clear()
+        await state.set_state(ConversionWorkflow.waiting_for_input)
+
+@dp.message(Command("zip"))
+async def cmd_zip(message: Message, state: FSMContext):
+    await state.clear()
+    await state.update_data(files_to_zip=[])
+    await message.answer(
+        "Send me the files you want to zip one by one.\n"
+        "When you are finished, send the command /done to get your archive."
+    )
+    await state.set_state(ArchiveStandaloneWorkflow.waiting_for_zip_files)
+
+@dp.message(ArchiveStandaloneWorkflow.waiting_for_zip_files, F.document)
+async def collect_files_for_zip(message: Message, state: FSMContext):
+    user_id = message.from_user.id
+    working_dir = os.path.abspath(f"./temp/zip_{user_id}")
+    os.makedirs(working_dir, exist_ok=True)
+    
+    file_path = os.path.join(working_dir, message.document.file_name)
+    await bot.download(message.document, destination=file_path)
+    
+    data = await state.get_data()
+    files_list = data.get("files_to_zip", [])
+    files_list.append(file_path)
+    
+    await state.update_data(files_to_zip=files_list)
+    await message.answer(f"Added `{message.document.file_name}`. Send more or type /done.", parse_mode="Markdown")
+
+@dp.message(ArchiveStandaloneWorkflow.waiting_for_zip_files, Command("done"))
+async def process_standalone_zip(message: Message, state: FSMContext):
+    data = await state.get_data()
+    files_list = data.get("files_to_zip", [])
+    user_id = message.from_user.id
+    working_dir = os.path.abspath(f"./temp/zip_{user_id}")
+    
+    if not files_list:
+        await message.answer("You didn't send any files! Zipping cancelled.")
+        await state.clear()
+        await state.set_state(ConversionWorkflow.waiting_for_input)
+        return
+        
+    status_msg = await message.answer("🗜 Zipping files...")
+    
+    try:
+        output_archive = os.path.join(working_dir, "Archive.zip")
+        create_zip(files_list, output_archive)
+        
+        await message.answer_document(FSInputFile(output_archive))
+        await status_msg.edit_text("✅ Zipping complete!")
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Error zipping: `{str(e)}`", parse_mode="Markdown")
+    finally:
+        shutil.rmtree(working_dir, ignore_errors=True)
+        await state.clear()
+        await state.set_state(ConversionWorkflow.waiting_for_input)
+
+
+# --- CONVERSION LOGIC CORE ---
 
 async def process_session(data: dict, output_format: str, user_id: int) -> Dict[str, str]:
-    """Handles the extraction, TGConvertor ingestion, and output generation workflow."""
-    
-    # Enforce absolute paths to prevent SQLite directory confusion
     working_dir = os.path.abspath(f"./temp/{user_id}")
     os.makedirs(working_dir, exist_ok=True)
     
@@ -231,12 +322,10 @@ async def process_session(data: dict, output_format: str, user_id: int) -> Dict[
     if is_string:
         session_string = data.get("session_string")
         if input_format == "telestr":
-            # Strings operate synchronously
             session = SessionManager.from_telethon_string(session_string)
         elif input_format == "pyrostr":
             session = SessionManager.from_pyrogram_string(session_string)
     else:
-        # Ensure input file path is absolute
         file_path = os.path.abspath(data.get("file_path"))
         input_target = file_path
         
@@ -245,7 +334,6 @@ async def process_session(data: dict, output_format: str, user_id: int) -> Dict[
             extract_archive(file_path, extract_dir)
             input_target = extract_dir
             
-        # Files and TData operate asynchronously
         if input_format == "telethon":
             session = await SessionManager.from_telethon_file(input_target)
         elif input_format == "pyrogram":
@@ -276,7 +364,6 @@ async def process_session(data: dict, output_format: str, user_id: int) -> Dict[
             await session.to_tdata_folder(output_folder)
             output_target = create_zip(output_folder, output_folder + ".zip")
             
-        # Safety check to dynamically find the file if TGConvertor mangled the extension
         if not os.path.exists(output_target):
             expected_ext = ".zip" if output_format == "tdata" else ".session"
             for file in os.listdir(working_dir):
@@ -284,7 +371,6 @@ async def process_session(data: dict, output_format: str, user_id: int) -> Dict[
                     output_target = os.path.join(working_dir, file)
                     break
                     
-        # Final validation to guarantee we don't pass a dead path to aiogram
         if not os.path.exists(output_target):
             raise FileNotFoundError(f"TGConvertor failed to generate the output file in {working_dir}")
             
