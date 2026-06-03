@@ -14,12 +14,14 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from TGConvertor import SessionManager
 
+# Try to import rarfile for .rar extraction support
 try:
     import rarfile
     RAR_SUPPORTED = True
 except ImportError:
     RAR_SUPPORTED = False
 
+# Setup Logging & Environment
 logging.basicConfig(level=logging.INFO)
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN")
 
@@ -34,13 +36,18 @@ class ConversionWorkflow(StatesGroup):
     session_string = State()
     is_string = State()
 
+
 # --- Archive Utilities ---
+
 def create_zip(file_paths: Union[str, List[str]], output_path: str) -> str:
+    """Compresses a file, directory, or list of files into a ZIP archive."""
     if not output_path.endswith('.zip'):
         output_path += '.zip'
+        
     with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
         if isinstance(file_paths, str):
             file_paths = [file_paths]
+            
         for path in file_paths:
             if os.path.isfile(path):
                 zipf.write(path, os.path.basename(path))
@@ -53,10 +60,13 @@ def create_zip(file_paths: Union[str, List[str]], output_path: str) -> str:
     return output_path
 
 def extract_archive(archive_path: str, extract_to: str) -> str:
+    """Extracts a .zip or .rar archive."""
     os.makedirs(extract_to, exist_ok=True)
+    
     if archive_path.lower().endswith('.zip'):
         with zipfile.ZipFile(archive_path, 'r') as zip_ref:
             zip_ref.extractall(extract_to)
+            
     elif archive_path.lower().endswith('.rar'):
         if not RAR_SUPPORTED:
             raise RuntimeError("rarfile package or unrar system dependency missing.")
@@ -66,7 +76,9 @@ def extract_archive(archive_path: str, extract_to: str) -> str:
         raise ValueError("Unsupported archive format. Send .zip or .rar.")
     return extract_to
 
+
 # --- Keyboards ---
+
 def get_input_file_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -100,11 +112,13 @@ def get_output_format_kb(exclude_format: str) -> InlineKeyboardMarkup:
         if fmt_id != exclude_format:
             buttons.append(InlineKeyboardButton(text=display_name, callback_data=f"out_{fmt_id}"))
             
-    # Arrange buttons 2 per row
+    # Arrange buttons 2 per row for better UI
     rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
+
 # --- Handlers ---
+
 @dp.message(CommandStart())
 async def start_handler(message: Message, state: FSMContext):
     await state.clear()
@@ -119,7 +133,7 @@ async def start_handler(message: Message, state: FSMContext):
 async def handle_text(message: Message, state: FSMContext):
     session_string = message.text.strip()
     
-    # Basic check to filter out regular chat messages (session strings are typically long)
+    # Filter out normal chat (session strings are typically long)
     if len(session_string) < 50:
         await message.answer("That string looks too short to be a valid session string. Please send a valid string, file, or archive.")
         return
@@ -174,7 +188,8 @@ async def execute_conversion(callback: CallbackQuery, state: FSMContext):
     await callback.message.edit_text("⏳ Processing conversion...")
     
     try:
-        result = await process_session(data, output_fmt, user_id)
+        # Run synchronous TGConvertor processes without blocking the main loop
+        result = await asyncio.to_thread(process_session, data, output_fmt, user_id)
         
         if result["type"] == "file":
             await callback.message.answer_document(FSInputFile(result["data"]))
@@ -195,8 +210,10 @@ async def execute_conversion(callback: CallbackQuery, state: FSMContext):
         await state.clear()
         await state.set_state(ConversionWorkflow.waiting_for_input)
 
+
 # --- Conversion Logic Core ---
-async def process_session(data: dict, output_format: str, user_id: int) -> Dict[str, str]:
+
+def process_session(data: dict, output_format: str, user_id: int) -> Dict[str, str]:
     """Handles the extraction, TGConvertor ingestion, and output generation workflow."""
     input_format = data.get("input_format")
     is_string = data.get("is_string")
@@ -209,9 +226,9 @@ async def process_session(data: dict, output_format: str, user_id: int) -> Dict[
     if is_string:
         session_string = data.get("session_string")
         if input_format == "telestr":
-            session = await SessionManager.from_telethon_string(session_string)
+            session = SessionManager.from_telethon_string(session_string)
         elif input_format == "pyrostr":
-            session = await SessionManager.from_pyrogram_string(session_string)
+            session = SessionManager.from_pyrogram_string(session_string)
     else:
         file_path = data.get("file_path")
         input_target = file_path
@@ -222,32 +239,32 @@ async def process_session(data: dict, output_format: str, user_id: int) -> Dict[
             input_target = extract_dir
             
         if input_format == "telethon":
-            session = await SessionManager.from_telethon_file(input_target)
+            session = SessionManager.from_telethon_file(input_target)
         elif input_format == "pyrogram":
-            session = await SessionManager.from_pyrogram_file(input_target)
+            session = SessionManager.from_pyrogram_file(input_target)
         elif input_format == "tdata":
-            session = await SessionManager.from_tdata_folder(input_target)
+            session = SessionManager.from_tdata_folder(input_target)
 
     # 2. EXPORT SESSION
     if output_format == "telestr":
-        string_out = await session.to_telethon_string()
+        string_out = session.to_telethon_string()
         return {"type": "string", "data": string_out}
         
     elif output_format == "pyrostr":
-        string_out = await session.to_pyrogram_string()
+        string_out = session.to_pyrogram_string()
         return {"type": "string", "data": string_out}
         
     else:
         output_target = os.path.join(working_dir, "converted_session")
         if output_format == "telethon":
             output_target += ".session"
-            await session.to_telethon_file(output_target)
+            session.to_telethon_file(output_target)
         elif output_format == "pyrogram":
             output_target += ".session"
-            await session.to_pyrogram_file(output_target)
+            session.to_pyrogram_file(output_target)
         elif output_format == "tdata":
             output_folder = os.path.join(working_dir, "tdata_out")
-            await session.to_tdata_folder(output_folder)
+            session.to_tdata_folder(output_folder)
             output_target = create_zip(output_folder, output_folder + ".zip")
             
         return {"type": "file", "data": output_target}
