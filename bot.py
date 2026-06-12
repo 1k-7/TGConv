@@ -3,7 +3,11 @@ import shutil
 import zipfile
 import asyncio
 import logging
+import base64
+import struct
+import json
 from typing import List, Union, Dict
+
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
@@ -20,6 +24,13 @@ try:
     RAR_SUPPORTED = True
 except ImportError:
     RAR_SUPPORTED = False
+
+# Try to import tgnet for Nicegram Support
+try:
+    from tgnet import Tgnet
+    TGNET_SUPPORTED = True
+except ImportError:
+    TGNET_SUPPORTED = False
 
 # Setup Logging & Environment
 logging.basicConfig(level=logging.INFO)
@@ -82,12 +93,66 @@ def find_tdata_root(base_path: str) -> str:
             if name == "__MACOSX":
                 shutil.rmtree(os.path.join(root, name), ignore_errors=True)
                 
-    # 2. Look for the directory containing 'key_data' (standard TData signature)
+    # 2. Look for the directory containing 'key_data'
     for root, _, files in os.walk(base_path):
         if any(f.startswith("key_data") for f in files):
             return root
             
     return base_path
+
+# --- Nicegram Injection Core ---
+def create_nicegram_backup(pyro_string: str, template_path: str, output_path: str) -> str:
+    if not TGNET_SUPPORTED:
+        raise RuntimeError("tgnet library is missing. Cannot convert to Nicegram.")
+    if not os.path.exists(template_path):
+        raise FileNotFoundError("Nicegram template (nicegram_template.zip) is missing on the server.")
+
+    # 1. Decode Pyrogram V2 Binary Structure
+    padded_string = pyro_string + "=" * (-len(pyro_string) % 4)
+    decoded = base64.urlsafe_b64decode(padded_string)
+    pyro_dc_id, api_id, test_mode, new_auth_key, user_id, is_bot = struct.unpack(">BI?256sQ?", decoded)
+    
+    # 2. Extract Template to Workspace
+    extract_dir = output_path + "_workspace"
+    if os.path.exists(extract_dir):
+        shutil.rmtree(extract_dir)
+    os.makedirs(extract_dir, exist_ok=True)
+    
+    with zipfile.ZipFile(template_path, 'r') as zip_ref:
+        zip_ref.extractall(extract_dir)
+        
+    # 3. Inject new session data
+    for root, dirs, files in os.walk(extract_dir):
+        # Target Binary MTProto Auth Key Storage
+        if "tgnet.dat" in files:
+            tgnet_path = os.path.join(root, "tgnet.dat")
+            tgnet_data = Tgnet(tgnet_path)
+            target_dc = tgnet_data.get_datacenter(pyro_dc_id)
+            
+            if target_dc:
+                old_auth_key = target_dc.get_auth_key_perm()
+                with open(tgnet_path, "rb") as f:
+                    raw_bytes = f.read()
+                # Swap out the 256-byte keys directly in the binary
+                with open(tgnet_path, "wb") as f:
+                    f.write(raw_bytes.replace(old_auth_key, new_auth_key))
+            else:
+                logging.warning(f"[Nicegram] Template lacks Datacenter match for DC {pyro_dc_id}")
+
+        # Target JSON App Configurations
+        if "session.json" in files:
+            json_path = os.path.join(root, "session.json")
+            with open(json_path, "r", encoding="utf-8") as f:
+                session_data = json.load(f)
+            
+            session_data["id"] = str(user_id)
+            with open(json_path, "w", encoding="utf-8") as f2:
+                json.dump(session_data, f2, indent=4)
+
+    # 4. Repackage maintaining original structure
+    create_zip(extract_dir, output_path)
+    shutil.rmtree(extract_dir, ignore_errors=True)
+    return output_path
 
 
 # --- Keyboards ---
@@ -115,6 +180,7 @@ def get_output_format_kb(exclude_format: str) -> InlineKeyboardMarkup:
         ("telethon", "Telethon File"), 
         ("pyrogram", "Pyrogram File"), 
         ("tdata", "TData (.zip)"),
+        ("nicegram", "Nicegram (.zip)"),
         ("telestr", "Telethon String"),
         ("pyrostr", "Pyrogram String")
     ]
@@ -417,7 +483,6 @@ async def process_session(data: dict, output_format: str, user_id: int) -> Dict[
         elif input_format == "pyrogram":
             sessions.append(await SessionManager.from_pyrogram_file(input_target))
 
-
     # 2. EXPORT SESSIONS
     if output_format in ["telestr", "pyrostr"]:
         strings_out = []
@@ -448,9 +513,14 @@ async def process_session(data: dict, output_format: str, user_id: int) -> Dict[
                 output_folder = os.path.join(working_dir, "tdata_out")
                 await s.to_tdata_folder(output_folder)
                 output_target = create_zip(output_folder, output_folder + ".zip")
+            elif output_format == "nicegram":
+                output_target = os.path.join(working_dir, "nicegram_export.zip")
+                template_path = os.path.abspath("nicegram_template.zip")
+                pyro_str = s.to_pyrogram_string()
+                create_nicegram_backup(pyro_str, template_path, output_target)
                 
             if not os.path.exists(output_target):
-                expected_ext = ".zip" if output_format == "tdata" else ".session"
+                expected_ext = ".zip" if output_format in ["tdata", "nicegram"] else ".session"
                 for file in os.listdir(working_dir):
                     if file.endswith(expected_ext) and "converted_session" in file:
                         output_target = os.path.join(working_dir, file)
@@ -465,6 +535,10 @@ async def process_session(data: dict, output_format: str, user_id: int) -> Dict[
                 if output_format == "tdata":
                     folder_path = os.path.join(output_folder, f"tdata_{sid}")
                     await s.to_tdata_folder(folder_path)
+                elif output_format == "nicegram":
+                    file_path = os.path.join(output_folder, f"nicegram_{sid}.zip")
+                    pyro_str = s.to_pyrogram_string()
+                    create_nicegram_backup(pyro_str, os.path.abspath("nicegram_template.zip"), file_path)
                 else:
                     file_path = os.path.join(output_folder, f"{sid}.session")
                     if output_format == "telethon":

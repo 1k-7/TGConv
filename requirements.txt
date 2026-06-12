@@ -6,3 +6,4 @@ Kurigram
 tgcrypto
 cryptg
 rarfile
+tgnet
