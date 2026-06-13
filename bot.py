@@ -101,6 +101,7 @@ def find_tdata_root(base_path: str) -> str:
             
     return base_path
 
+
 # --- Nicegram Extraction Core ---
 def parse_nicegram_backup(archive_path: str, working_dir: str) -> List[SessionManager]:
     if not TGNET_SUPPORTED:
@@ -123,18 +124,36 @@ def parse_nicegram_backup(archive_path: str, working_dir: str) -> List[SessionMa
 
                 tgnet_data = Tgnet(tgnet_path)
                 
-                # Dynamically find the DC holding the active auth key to prevent USER_MIGRATE errors
-                for i in range(1, 6):
-                    dc = tgnet_data.get_datacenter(i)
-                    if dc:
-                        key = dc.get_auth_key_perm()
-                        if key and len(key) == 256 and key != (b'\x00' * 256):
-                            parsed_sessions.append(SessionManager(
-                                auth_key=key,
-                                user_id=user_id,
-                                dc_id=i  # Correctly lock the session to the detected Datacenter
-                            ))
-                            break
+                key = None
+                dc_id = 2 
+
+                # 1. Safely fetch the EXACT Current Active Datacenter to prevent USER_MIGRATE mismatches
+                if hasattr(tgnet_data, 'get_current_datacenter'):
+                    current_dc = tgnet_data.get_current_datacenter()
+                    if current_dc:
+                        dc_id = current_dc.id
+                        key = current_dc.get_auth_key_perm()
+                
+                # 2. Validate the main key
+                if key and len(key) == 256 and key != (b'\x00' * 256):
+                    parsed_sessions.append(SessionManager(
+                        auth_key=key,
+                        user_id=user_id,
+                        dc_id=dc_id
+                    ))
+                else:
+                    # 3. Fallback: Search all DCs ONLY if the main DC slot was empty/corrupted
+                    for i in range(1, 6):
+                        dc = tgnet_data.get_datacenter(i)
+                        if dc:
+                            fallback_key = dc.get_auth_key_perm()
+                            if fallback_key and len(fallback_key) == 256 and fallback_key != (b'\x00' * 256):
+                                parsed_sessions.append(SessionManager(
+                                    auth_key=fallback_key,
+                                    user_id=user_id,
+                                    dc_id=i
+                                ))
+                                break
 
             except Exception as e:
                 logging.error(f"[Nicegram Parser] Error parsing account at {root}: {e}")
@@ -428,6 +447,7 @@ async def execute_conversion(callback: CallbackQuery, state: FSMContext):
             await callback.message.answer_document(FSInputFile(result["data"]))
             await callback.message.edit_text("✅ **Conversion successful!**", parse_mode="Markdown")
         elif result["type"] == "string":
+            # If multiple strings were generated, they'll be separated by '---'
             await callback.message.edit_text(
                 f"✅ **Conversion successful! Here is your string(s):**\n\n`{result['data']}`", 
                 parse_mode="Markdown"
@@ -491,6 +511,7 @@ async def process_session(data: dict, output_format: str, user_id: int) -> Dict[
             extract_archive(file_path, extract_dir)
             input_target = find_tdata_root(extract_dir)
             
+            # Direct `opentele` integration to scrape all embedded accounts
             from opentele.td import TDesktop
             try:
                 td = TDesktop(input_target)
@@ -513,6 +534,7 @@ async def process_session(data: dict, output_format: str, user_id: int) -> Dict[
         elif input_format == "nicegram":
             extracted_sessions = parse_nicegram_backup(input_target, working_dir)
             sessions.extend(extracted_sessions)
+
 
     # 2. EXPORT SESSIONS
     if output_format in ["telestr", "pyrostr"]:
@@ -556,6 +578,7 @@ async def process_session(data: dict, output_format: str, user_id: int) -> Dict[
                         output_target = os.path.join(working_dir, file)
                         break
         else:
+            # Multi-account batch processing logic
             output_folder = os.path.join(working_dir, "converted_sessions")
             os.makedirs(output_folder, exist_ok=True)
             
@@ -575,6 +598,7 @@ async def process_session(data: dict, output_format: str, user_id: int) -> Dict[
                     elif output_format == "pyrogram":
                         await s.to_pyrogram_file(file_path)
                         
+            # Repackage the multiple outputs into a single zip structure
             output_target = create_zip(output_folder, output_folder + ".zip")
 
         if not os.path.exists(output_target):
