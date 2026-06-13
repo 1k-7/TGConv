@@ -123,26 +123,18 @@ def parse_nicegram_backup(archive_path: str, working_dir: str) -> List[SessionMa
 
                 tgnet_data = Tgnet(tgnet_path)
                 
-                auth_key = None
-                dc_id = 2 
-                
+                # Dynamically find the DC holding the active auth key to prevent USER_MIGRATE errors
                 for i in range(1, 6):
                     dc = tgnet_data.get_datacenter(i)
                     if dc:
                         key = dc.get_auth_key_perm()
                         if key and len(key) == 256 and key != (b'\x00' * 256):
-                            auth_key = key
-                            dc_id = i
+                            parsed_sessions.append(SessionManager(
+                                auth_key=key,
+                                user_id=user_id,
+                                dc_id=i  # Correctly lock the session to the detected Datacenter
+                            ))
                             break
-                
-                if auth_key:
-                    parsed_sessions.append(SessionManager(
-                        auth_key=auth_key,
-                        user_id=user_id,
-                        dc_id=dc_id
-                    ))
-                else:
-                    logging.warning(f"[Nicegram Parser] Could not find a valid auth_key in {root}")
 
             except Exception as e:
                 logging.error(f"[Nicegram Parser] Error parsing account at {root}: {e}")
@@ -151,6 +143,7 @@ def parse_nicegram_backup(archive_path: str, working_dir: str) -> List[SessionMa
         raise ValueError("No valid accounts or authorization keys found in the Nicegram archive.")
         
     return parsed_sessions
+
 
 # --- Nicegram Injection Core ---
 def create_nicegram_backup(pyro_string: str, output_path: str) -> str:
@@ -592,3 +585,4 @@ async def process_session(data: dict, output_format: str, user_id: int) -> Dict[
 
 if __name__ == "__main__":
     asyncio.run(dp.start_polling(bot))
+
