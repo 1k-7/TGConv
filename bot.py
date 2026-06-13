@@ -127,14 +127,12 @@ def parse_nicegram_backup(archive_path: str, working_dir: str) -> List[SessionMa
                 key = None
                 dc_id = 2 
 
-                # 1. Safely fetch the EXACT Current Active Datacenter to prevent USER_MIGRATE mismatches
                 if hasattr(tgnet_data, 'get_current_datacenter'):
                     current_dc = tgnet_data.get_current_datacenter()
                     if current_dc:
                         dc_id = current_dc.id
                         key = current_dc.get_auth_key_perm()
                 
-                # 2. Validate the main key
                 if key and len(key) == 256 and key != (b'\x00' * 256):
                     parsed_sessions.append(SessionManager(
                         auth_key=key,
@@ -142,7 +140,6 @@ def parse_nicegram_backup(archive_path: str, working_dir: str) -> List[SessionMa
                         dc_id=dc_id
                     ))
                 else:
-                    # 3. Fallback: Search all DCs ONLY if the main DC slot was empty/corrupted
                     for i in range(1, 6):
                         dc = tgnet_data.get_datacenter(i)
                         if dc:
@@ -182,20 +179,41 @@ def create_nicegram_backup(pyro_string: str, output_path: str) -> str:
                 with open(temp_tgnet, "wb") as f:
                     f.write(raw_bytes)
                 
-                tgnet_data = Tgnet(temp_tgnet)
-                target_dc = tgnet_data.get_datacenter(pyro_dc_id)
-                
-                if target_dc:
-                    old_auth_key = target_dc.get_auth_key_perm()
-                    raw_bytes = raw_bytes.replace(old_auth_key, new_auth_key)
-                else:
-                    logging.warning(f"[Nicegram] Template lacks Datacenter match for DC {pyro_dc_id}")
-                
-                os.remove(temp_tgnet) 
+                try:
+                    tgnet_data = Tgnet(temp_tgnet)
+                    # Find all valid 256-byte keys in the template and replace them with the new key.
+                    # This ensures that no matter which DC the app connects to first, it presents 
+                    # the valid key and triggers a graceful USER_MIGRATE instead of an AUTH_UNREGISTERED logout.
+                    keys_to_replace = []
+                    for i in range(1, 6):
+                        dc = tgnet_data.get_datacenter(i)
+                        if dc:
+                            k = dc.get_auth_key_perm()
+                            if k and len(k) == 256 and k != (b'\x00' * 256):
+                                if k not in keys_to_replace:
+                                    keys_to_replace.append(k)
+                                    
+                    for old_k in keys_to_replace:
+                        raw_bytes = raw_bytes.replace(old_k, new_auth_key)
+                except Exception as e:
+                    logging.error(f"Error patching tgnet.dat: {e}")
+                finally:
+                    if os.path.exists(temp_tgnet):
+                        os.remove(temp_tgnet) 
 
             elif filename.endswith("session.json"):
                 session_data = json.loads(raw_bytes.decode("utf-8"))
+                
+                # 1. Update the structural ID 
                 session_data["id"] = str(user_id)
+                # 2. Update the default cosmetic name to prevent confusion
+                session_data["name"] = f"Account {user_id}"
+                
+                # 3. Clear the cached cosmetic binary blob. 
+                # This forces the app to immediately fetch the real profile metadata from Telegram's servers.
+                if "user" in session_data:
+                    session_data["user"] = ""
+                    
                 raw_bytes = json.dumps(session_data, indent=4).encode("utf-8")
             
             zipf.writestr(filename, raw_bytes)
@@ -447,7 +465,6 @@ async def execute_conversion(callback: CallbackQuery, state: FSMContext):
             await callback.message.answer_document(FSInputFile(result["data"]))
             await callback.message.edit_text("✅ **Conversion successful!**", parse_mode="Markdown")
         elif result["type"] == "string":
-            # If multiple strings were generated, they'll be separated by '---'
             await callback.message.edit_text(
                 f"✅ **Conversion successful! Here is your string(s):**\n\n`{result['data']}`", 
                 parse_mode="Markdown"
@@ -511,7 +528,6 @@ async def process_session(data: dict, output_format: str, user_id: int) -> Dict[
             extract_archive(file_path, extract_dir)
             input_target = find_tdata_root(extract_dir)
             
-            # Direct `opentele` integration to scrape all embedded accounts
             from opentele.td import TDesktop
             try:
                 td = TDesktop(input_target)
@@ -609,4 +625,3 @@ async def process_session(data: dict, output_format: str, user_id: int) -> Dict[
 
 if __name__ == "__main__":
     asyncio.run(dp.start_polling(bot))
-
